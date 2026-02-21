@@ -1,0 +1,85 @@
+# MLX Audio Wrapper Service
+
+This service provides a FastAPI wrapper around MLX-optimized Qwen3-ASR models. It's built for high-performance audio transcription on Apple Silicon with built-in observability and automatic language detection.
+
+## Setup
+
+1.  **Environment Configuration**:
+    Copy the example environment file and adjust settings as needed.
+    ```bash
+    cp config/service.env.example .env
+    ```
+
+2.  **Dependencies**:
+    Ensure you have `mlx`, `mlx-audio`, `fastapi`, `uvicorn`, and `prometheus_client` installed.
+
+3.  **Model Path**:
+    The service currently uses the model located at:
+    `/Volumes/AigoP3500/models/lmstudio/models/mlx-community/Qwen3-ASR-0.6B-bf16`
+
+## Running the Service
+
+Start the server using `uvicorn`:
+
+```bash
+uvicorn asr_service.service:app --host 127.0.0.1 --port 8010
+```
+
+## API Usage
+
+### Health Check
+Check if the service is up and see the current device status.
+```bash
+curl http://127.0.0.1:8010/health
+```
+
+### Transcription
+Transcribe an audio file. The service supports automatic language detection by default.
+
+**Auto Language Detection**:
+```bash
+curl -X POST http://127.0.0.1:8010/v1/audio/transcriptions \
+  -F "file=@/path/to/audio.wav" \
+  -F "language=auto"
+```
+
+**Forced Language**:
+```bash
+curl -X POST http://127.0.0.1:8010/v1/audio/transcriptions \
+  -F "file=@/path/to/audio.wav" \
+  -F "language=Chinese"
+```
+
+### Metrics
+The service exports Prometheus metrics at `/metrics`, including:
+- Request counts and durations.
+- Active request tracking.
+- GPU memory usage (MLX reserved memory).
+- Error counts by type.
+
+```bash
+curl http://127.0.0.1:8010/metrics
+```
+
+## Configuration
+
+Settings are managed via environment variables with the `ASR_` prefix.
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `ASR_MODEL_PATH` | Path to the MLX model directory | (See `.env.example`) |
+| `ASR_HOST` | Server host address | `127.0.0.1` |
+| `ASR_PORT` | Server port | `8010` |
+| `ASR_MAX_TOKENS` | Maximum tokens for output | `4800` |
+| `ASR_CHUNK_DURATION` | VAD chunk size in seconds | `30.0` |
+| `ASR_MAX_FILE_SIZE_MB` | Max audio file size | `100` |
+
+## Benchmarking
+
+Use the included stress test script to measure performance across different concurrency levels.
+
+```bash
+python benchmarks/asr_stress_bench.py --audio /path/to/test_audio.wav --concurrency 1,2,4
+```
+
+The script generates a JSON report at `/tmp/asr_bench_results.json` by default.
