@@ -4,6 +4,7 @@ This module provides a centralized configuration class with typed fields,
 explicit defaults, and environment variable override support.
 """
 
+from pathlib import Path
 from typing import Optional
 
 from pydantic import Field, field_validator
@@ -34,6 +35,12 @@ class Config(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+    )
+
+    # Model path
+    model_path: Path = Field(
+        default=Path("/Volumes/AigoP3500/models/lmstudio/models/mlx-community/Qwen3-ASR-0.6B-bf16"),
+        description="Path to the ASR model directory.",
     )
 
     # Language and model parameters

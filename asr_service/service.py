@@ -1,10 +1,14 @@
+import asyncio
+import json
+import time
+import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Optional
 
 import mlx.core as mx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from mlx_audio.stt.generate import generate_transcription
 from mlx_audio.stt.models.qwen3_asr.qwen3_asr import Qwen3ASRModel
 from mlx_audio.stt.utils import load_model
@@ -32,9 +36,7 @@ from asr_service.validators import (
 from asr_service.queue import QueuedRequest, get_request_queue
 
 
-MODEL_PATH = Path(
-    "/Volumes/AigoP3500/models/lmstudio/models/mlx-community/Qwen3-ASR-0.6B-bf16"
-)
+MODEL_PATH = config.model_path
 
 app = FastAPI(title="MLX Qwen3-ASR Service", version="1.0")
 
@@ -47,6 +49,7 @@ state = {
     "ready": False,
     "warmup_error": None,
     "shutting_down": False,
+    "stream_lock": asyncio.Lock(),
 }
 
 
@@ -314,6 +317,9 @@ async def transcriptions(
     file: UploadFile = File(...),
     model: str = Form(default=str(MODEL_PATH)),
     language: str = Form(default="auto"),
+    stream: bool = Form(default=False),
+    response_format: str = Form(default="json"),
+    include_accumulated: bool = Form(default=False),
     request: Request = None,  # type: ignore
 ) -> dict:
     # Check if service is shutting down
@@ -334,59 +340,249 @@ async def transcriptions(
     # Get request_id from middleware state
     request_id = getattr(request.state, "request_id", None) if request else None
 
-    with track_request("POST", "/v1/audio/transcriptions", request_id):
-        # Read file content first (needed for queue)
-        content = await file.read()
-        suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    # Read file content first (needed for queue and streaming)
+    content = await file.read()
+    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
 
-        # === INPUT GUARDRAILS ===
-        # Run validation before queueing (need temp file for duration check)
-        temp_path = None
+    # === INPUT GUARDRAILS ===
+    # Run validation before queueing or streaming (need temp file for duration check)
+    temp_path = None
+    try:
+        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = Path(tmp.name)
+            tmp.write(content)
+
         try:
-            with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                temp_path = Path(tmp.name)
-                tmp.write(content)
+            validate_input(
+                filename=file.filename or "audio.wav",
+                content=content,
+                audio_path=temp_path,
+            )
+        except FileSizeError as e:
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/v1/audio/transcriptions",
+                status="file_size_error",
+            ).inc()
+            raise HTTPException(status_code=413, detail=e.message)
+        except FormatError as e:
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/v1/audio/transcriptions",
+                status="format_error",
+            ).inc()
+            raise HTTPException(status_code=415, detail=e.message)
+        except DurationError as e:
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/v1/audio/transcriptions",
+                status="duration_error",
+            ).inc()
+            raise HTTPException(status_code=400, detail=e.message)
+        except TimeoutError as e:
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/v1/audio/transcriptions",
+                status="timeout_error",
+            ).inc()
+            raise HTTPException(status_code=408, detail=e.message)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+    # === END INPUT GUARDRAILS ===
+
+    if stream:
+        stream_lock = state["stream_lock"]
+        if stream_lock.locked():
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/v1/audio/transcriptions",
+                status="streaming_busy",
+            ).inc()
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "Only one streaming transcription is allowed at a time"},
+            )
+
+        await stream_lock.acquire()
+        forced_language = _normalize_language(language)
+        
+        # Determine if we should use SSE format (vLLM-compatible)
+        use_sse = stream and response_format == "json"
+
+        async def stream_response():
+            stream_temp_path = None
+            stream_status = "success"
+            start_time = time.perf_counter()
+            accumulated_raw = ""
+            accumulated_clean = ""
+            emitted_final = False
+            transcribe_id = f"transcribe-{uuid.uuid4()}"
+            created_timestamp = int(time.time())
 
             try:
-                validate_input(
-                    filename=file.filename or "audio.wav",
-                    content=content,
-                    audio_path=temp_path,
-                )
-            except FileSizeError as e:
-                REQUEST_COUNT.labels(
-                    method="POST",
-                    endpoint="/v1/audio/transcriptions",
-                    status="file_size_error",
-                ).inc()
-                raise HTTPException(status_code=413, detail=e.message)
-            except FormatError as e:
-                REQUEST_COUNT.labels(
-                    method="POST",
-                    endpoint="/v1/audio/transcriptions",
-                    status="format_error",
-                ).inc()
-                raise HTTPException(status_code=415, detail=e.message)
-            except DurationError as e:
-                REQUEST_COUNT.labels(
-                    method="POST",
-                    endpoint="/v1/audio/transcriptions",
-                    status="duration_error",
-                ).inc()
-                raise HTTPException(status_code=400, detail=e.message)
-            except TimeoutError as e:
-                REQUEST_COUNT.labels(
-                    method="POST",
-                    endpoint="/v1/audio/transcriptions",
-                    status="timeout_error",
-                ).inc()
-                raise HTTPException(status_code=408, detail=e.message)
-        finally:
-            if temp_path is not None and temp_path.exists():
-                temp_path.unlink()
+                with track_request("POST", "/v1/audio/transcriptions", request_id):
+                    with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        stream_temp_path = Path(tmp.name)
+                        tmp.write(content)
 
-        # === END INPUT GUARDRAILS ===
+                    with TimeoutContext(config.request_timeout_sec) as timeout_ctx:
+                        token_stream = state["model"].generate(
+                            str(stream_temp_path),
+                            language=forced_language,
+                            verbose=False,
+                            stream=True,
+                        )
 
+                        for chunk in token_stream:
+                            timeout_ctx.check_timeout()
+
+                            if request is not None and await request.is_disconnected():
+                                stream_status = "error"
+                                break
+
+                            # Get raw token text for SSE delta
+                            raw_chunk_text = getattr(chunk, "text", "") or ""
+                            accumulated_raw += raw_chunk_text
+                            detected_language, parsed_text = _parse_asr_output(
+                                accumulated_raw,
+                                forced_language=forced_language,
+                            )
+
+                            delta_text = ""
+                            if parsed_text.startswith(accumulated_clean):
+                                delta_text = parsed_text[len(accumulated_clean) :]
+                            elif parsed_text != accumulated_clean:
+                                delta_text = parsed_text
+
+                            accumulated_clean = parsed_text
+                            is_final = bool(getattr(chunk, "is_final", False))
+                            emitted_final = emitted_final or is_final
+
+                            if use_sse:
+                                # SSE format (vLLM-compatible)
+                                if is_final:
+                                    # Final chunk: empty content with finish_reason
+                                    event_data = {
+                                        "id": transcribe_id,
+                                        "object": "transcription.chunk",
+                                        "created": created_timestamp,
+                                        "model": model,
+                                        "choices": [
+                                            {
+                                                "delta": {
+                                                    "content": "",  # Empty content for final
+                                                },
+                                                "finish_reason": "stop",
+                                                "stop_reason": None,
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    break  # Stop streaming
+                                else:
+                                    # Regular chunk
+                                    event_data = {
+                                        "id": transcribe_id,
+                                        "object": "transcription.chunk",
+                                        "created": created_timestamp,
+                                        "model": model,
+                                        "choices": [
+                                            {
+                                                "delta": {
+                                                    "content": raw_chunk_text,
+                                                },
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                            else:
+                                # Original ndjson format
+                                yield (
+                                    json.dumps(
+                                        {
+                                            "text": delta_text,
+                                            "is_final": is_final,
+                                            "language": detected_language,
+                                            **(
+                                                {"accumulated": accumulated_clean}
+                                                if include_accumulated
+                                                else {}
+                                            ),
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n"
+                                )
+
+                    if stream_status == "success" and not emitted_final:
+                        detected_language, parsed_text = _parse_asr_output(
+                            accumulated_raw,
+                            forced_language=forced_language,
+                        )
+                        if use_sse:
+                            # Emit final chunk with empty content, finish_reason="stop"
+                            final_event = {
+                                "id": transcribe_id,
+                                "object": "transcription.chunk",
+                                "created": created_timestamp,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "delta": {
+                                            "content": "",
+                                        },
+                                        "finish_reason": "stop",
+                                        "stop_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                        else:
+                            yield (
+                                json.dumps(
+                                    {
+                                        "text": "",
+                                        "is_final": True,
+                                        "language": detected_language,
+                                        **(
+                                            {"accumulated": parsed_text}
+                                            if include_accumulated
+                                            else {}
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+            except TimeoutError:
+                stream_status = "error"
+                raise
+            except Exception:
+                stream_status = "error"
+                raise
+            finally:
+                REQUEST_DURATION.labels(
+                    method="POST",
+                    endpoint="/v1/audio/transcriptions",
+                ).observe(time.perf_counter() - start_time)
+                REQUEST_COUNT.labels(
+                    method="POST",
+                    endpoint="/v1/audio/transcriptions",
+                    status=stream_status,
+                ).inc()
+                if stream_temp_path is not None and stream_temp_path.exists():
+                    stream_temp_path.unlink()
+                if stream_lock.locked():
+                    stream_lock.release()
+
+        media_type = "text/event-stream" if use_sse else "application/x-ndjson"
+        return StreamingResponse(stream_response(), media_type=media_type)
+
+    with track_request("POST", "/v1/audio/transcriptions", request_id):
         # === QUEUE ADMISSION ===
         # Try to add request to queue (non-blocking)
         queue = get_request_queue()
@@ -395,6 +591,7 @@ async def transcriptions(
             file_suffix=suffix,
             language=language,
             model=model,
+            stream=stream,
             request_id=request_id,
         )
 
@@ -413,6 +610,14 @@ async def transcriptions(
                     "retry_after": "30",
                 },
             )
+
+        if queued_request is None:
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/v1/audio/transcriptions",
+                status="processing_error",
+            ).inc()
+            raise HTTPException(status_code=500, detail="Queue admission failed unexpectedly")
 
         # === WAIT FOR RESULT ===
         # Wait for the worker to process the request

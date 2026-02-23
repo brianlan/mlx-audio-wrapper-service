@@ -21,6 +21,7 @@ class QueuedRequest:
     file_suffix: str
     language: Optional[str]
     model: str
+    stream: bool
     future: asyncio.Future
 
 
@@ -67,6 +68,7 @@ class RequestQueue:
         file_suffix: str,
         language: Optional[str],
         model: str,
+        stream: bool,
         request_id: Optional[str] = None,
     ) -> tuple[bool, Optional[QueuedRequest]]:
         """Try to add a request to the queue (non-blocking).
@@ -76,6 +78,7 @@ class RequestQueue:
             file_suffix: File extension (e.g., '.wav')
             language: Language hint
             model: Model path
+            stream: Whether to stream the response
             request_id: Optional request ID (generated if not provided)
 
         Returns:
@@ -89,6 +92,7 @@ class RequestQueue:
             file_suffix=file_suffix,
             language=language,
             model=model,
+            stream=stream,
             future=asyncio.Future(),
         )
 

@@ -22,7 +22,7 @@ This service provides a FastAPI wrapper around MLX-optimized Qwen3-ASR models. I
 Start the server using `uvicorn`:
 
 ```bash
-uvicorn asr_service.service:app --host 127.0.0.1 --port 8010
+python -m uvicorn asr_service.service:app --host 127.0.0.1 --port 8010 --app-dir .
 ```
 
 ## API Usage
@@ -49,6 +49,51 @@ curl -X POST http://127.0.0.1:8010/v1/audio/transcriptions \
   -F "file=@/path/to/audio.wav" \
   -F "language=Chinese"
 ```
+
+### Streaming
+Real-time transcription streaming.
+
+**Streaming Request**:
+```bash
+curl -N -X POST http://127.0.0.1:8010/v1/audio/transcriptions \
+  -F "file=@/path/to/audio.wav" \
+  -F "model=/Volumes/AigoP3500/models/lmstudio/models/mlx-community/Qwen3-ASR-0.6B-bf16" \
+  -F "response_format=json" \
+  -F "stream=true"
+```
+
+When `stream=true` and `response_format=json`, the response is SSE (`text/event-stream`) in a vLLM-like format:
+
+```
+data: {"id":"transcribe-...","object":"transcription.chunk","created":...,"model":"...","choices":[{"delta":{"content":"..."}}]}
+
+...
+
+data: {"id":"transcribe-...","object":"transcription.chunk","created":...,"model":"...","choices":[{"delta":{"content":""},"finish_reason":"stop","stop_reason":null}]}
+
+data: [DONE]
+```
+
+NDJSON mode is also available for simpler parsing by setting `response_format=ndjson`. In that mode you may optionally include the full transcript-so-far in each chunk via `include_accumulated=true`:
+
+```bash
+curl -N -X POST http://127.0.0.1:8010/v1/audio/transcriptions \
+  -F "file=@/path/to/audio.wav" \
+  -F "response_format=ndjson" \
+  -F "stream=true" \
+  -F "include_accumulated=true"
+```
+
+**Output Format**:
+Each line is a JSON object:
+- `text`: The new text chunk (delta) since the last update.
+- `is_final`: Boolean indicating if this is the final result.
+- `language`: Detected or forced language.
+
+When `include_accumulated=true`, each line also includes:
+- `accumulated`: The full transcript generated so far.
+
+**Note**: Only one streaming request is processed at a time. Concurrent streaming requests return a `429 Too Many Requests` response.
 
 ### Metrics
 The service exports Prometheus metrics at `/metrics`, including:
