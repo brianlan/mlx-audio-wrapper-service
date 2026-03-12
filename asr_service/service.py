@@ -157,7 +157,7 @@ def _parse_asr_output(raw: str, forced_language: Optional[str]) -> tuple[Optiona
                 detected_language = candidate
             break
 
-    return detected_language, text
+    return detected_language, text + " " if text else text
 
 
 def _patch_qwen3_prompt_for_auto_lid() -> None:
