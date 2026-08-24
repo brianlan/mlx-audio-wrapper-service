@@ -10,7 +10,6 @@ import mlx.core as mx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from mlx_audio.stt.generate import generate_transcription
-from mlx_audio.stt.models.qwen3_asr.qwen3_asr import Qwen3ASRModel
 from mlx_audio.stt.utils import load_model
 from starlette.requests import Request
 from starlette.responses import Response
@@ -160,27 +159,6 @@ def _parse_asr_output(raw: str, forced_language: Optional[str]) -> tuple[Optiona
     return detected_language, text + " " if text else text
 
 
-def _patch_qwen3_prompt_for_auto_lid() -> None:
-    if state.get("auto_lid_patch_applied"):
-        return
-
-    original = Qwen3ASRModel._build_prompt
-
-    def patched(self, num_audio_tokens: int, language: str = "English"):
-        if language is None:
-            prompt = (
-                f"<|im_start|>system\n<|im_end|>\n"
-                f"<|im_start|>user\n<|audio_start|>{'<|audio_pad|>' * num_audio_tokens}<|audio_end|><|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-            input_ids = self._tokenizer.encode(prompt, return_tensors="np")
-            return mx.array(input_ids)
-        return original(self, num_audio_tokens, language)
-
-    Qwen3ASRModel._build_prompt = patched
-    state["auto_lid_patch_applied"] = True
-
-
 def _warmup_model() -> None:
     """Run a warmup inference to ensure model is fully loaded and ready."""
     import io
@@ -229,7 +207,6 @@ def _warmup_model() -> None:
 async def startup_event() -> None:
     if not MODEL_PATH.exists():
         raise RuntimeError(f"Model path does not exist: {MODEL_PATH}")
-    _patch_qwen3_prompt_for_auto_lid()
     state["model"] = load_model(str(MODEL_PATH))
     state["device"] = str(mx.default_device())
     # Run warmup inference to ensure model is ready
